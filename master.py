@@ -11,8 +11,11 @@ import select
 import pickle
 import subprocess
 import logging
+import uuid
+import time
 import threading
 from xmlrpc.server import SimpleXMLRPCServer
+import googleapiclient.discovery
 
 
 
@@ -53,7 +56,7 @@ class Master:
             logging.info("partitioning data into chunks..")
             numWorkers = len(self.config['workers'])
             ind = [int(i*len(input_data)/numWorkers) for i in range(numWorkers)] + [len(input_data)]
-            if type(input_data) == str:
+            if type(input_data) in (str, list, tuple):
                 chunks = [input_data[ind[i]:ind[i+1]] for i in range(numWorkers)]
             elif type(input_data) == dict:
                 input_data = list(input_data.items())
@@ -68,10 +71,18 @@ class Master:
             
             # Clearing any existing data for intermediate key as mapper calls append method to
             # add data to intermediate_key
+            logging.debug("Clearing existing data for key for intermediate value..")
             intermediate_data = self.config["intermediate_data"]
             set_key(self.cs, intermediate_data["task_address"], [])
             
             # Provisioning gcloud compute instances for worker nodes
+            oslogin = googleapiclient.discovery.build("oslogin", "v1")
+            account = self.config["service_account"]["address"]
+            if not account.startswith('users/'):
+                account = 'users/' + account
+            private_key_file = create_ssh_key(oslogin, account)
+            profile = oslogin.users().getLoginProfile(name=account).execute()
+            username = profile.get('posixAccounts')[0].get('username')
             numWorkers = len(self.config['workers'])
             workers = self.config['workers']
             master = self.config["master"]
@@ -203,6 +214,32 @@ def set_key(sock, key, value):
     msg = recv_msg(sock)
     if msg == False:
         raise(Exception("Couldn't set value.."))
+
+def create_ssh_key(oslogin, account, private_key_file=None, expire_time=300):
+    """Generate an SSH key pair and apply it to the specified account."""
+    private_key_file = private_key_file or '/tmp/key-' + str(uuid.uuid4())
+    cmd = ['ssh-keygen', '-t', 'rsa', '-N', '', '-f', private_key_file]
+    keygen = subprocess.Popen(cmd, shell = False, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+    keygen.wait()
+    output = keygen.communicate()[0]
+    returncode = keygen.returncode
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, cmd)
+    if output:
+        logging.info(output)
+
+    with open(private_key_file + '.pub', 'r') as original:
+        public_key = original.read().strip()
+
+    # Expiration time is in microseconds.
+    expiration = int((time.time() + expire_time) * 1000000)
+
+    body = {
+        'key': public_key,
+        'expirationTimeUsec': expiration,
+    }
+    oslogin.users().importSshPublicKey(parent=account, body=body).execute()
+    return private_key_file
 
 def start_worker(error, master, mapper, worker, data_store, op_key, ip_key):
     if master["task_address"] != worker["task_address"]:
