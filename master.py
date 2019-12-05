@@ -76,13 +76,11 @@ class Master:
             set_key(self.cs, intermediate_data["task_address"], [])
             
             # Provisioning gcloud compute instances for worker nodes
-            oslogin = googleapiclient.discovery.build("oslogin", "v1")
-            account = self.config["service_account"]["address"]
-            if not account.startswith('users/'):
-                account = 'users/' + account
-            private_key_file = create_ssh_key(oslogin, account)
-            profile = oslogin.users().getLoginProfile(name=account).execute()
-            username = profile.get('posixAccounts')[0].get('username')
+            self.oslogin = googleapiclient.discovery.build("oslogin", "v1")
+            self.account = self.config["service_account"]["address"]
+            if not self.account.startswith('users/'):
+                self.account = 'users/' + self.account
+            self.compute = googleapiclient.discovery.build('compute', 'v1')
             numWorkers = len(self.config['workers'])
             workers = self.config['workers']
             master = self.config["master"]
@@ -97,6 +95,13 @@ class Master:
             
     
     def runmapred(self):
+        """
+        Include this when sshing into remote vm to submit map-reduce tasks:
+            private_key_file = create_ssh_key(oslogin, account)
+            profile = oslogin.users().getLoginProfile(name=account).execute()
+            username = profile.get('posixAccounts')[0].get('username')
+        """
+        
         try:
             # Master configuration
             master = self.config["master"]
