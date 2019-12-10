@@ -58,7 +58,7 @@ class serverSocket:
     Creates a server socket and implements some method to allow interaction with 
     the socket.
     """
-    def __init__(self, s = None, mcr = 100, host = socket.gethostname(), port = 9889):
+    def __init__(self, s = None, mcr = 100, host = socket.gethostbyname(socket.gethostname()), port = 9889):
         if s == None:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         else:

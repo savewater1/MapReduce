@@ -15,7 +15,8 @@ import uuid
 import time
 import threading
 from xmlrpc.server import SimpleXMLRPCServer
-import googleapiclient.discovery
+from googleapiclient import discovery
+from oauth2client.client import GoogleCredentials
 
 
 
@@ -76,12 +77,13 @@ class Master:
             set_key(self.cs, intermediate_data["task_address"], [])
             
             # Provisioning gcloud compute instances for worker nodes
-            self.oslogin = googleapiclient.discovery.build("oslogin", "v1")
+            self.oslogin = discovery.build("oslogin", "v1")
             # ADD service account details in config
             self.account = self.config["gcloud"]["service_account"]
             if not self.account.startswith('users/'):
                 self.account = 'users/' + self.account
-            self.compute = googleapiclient.discovery.build('compute', 'v1')
+            credentials = GoogleCredentials.get_application_default()
+            self.compute = discovery.build('compute', 'v1', credentials=credentials)
             # Add project, zone and network info in config
             self.gcloud = self.config["gcloud"]
             
@@ -109,7 +111,7 @@ class Master:
             intermediate_data = self.config["intermediate_data"]
             logging.debug("Starting mappers..")
             for worker, ip in zip(mapper["workers"], self.chunk_keys):
-                t = threading.Thread(target = start_worker, args = (error, self.oslogin, self.gcloud["service_account"], master, mapper, worker, self.data_store, intermediate_data["task_address"], ip))
+                t = threading.Thread(target = start_worker, args = (error, self.oslogin, self.gcloud["service_account"], master, mapper["task_name"], worker, self.data_store, intermediate_data["task_address"], ip))
                 t.start()
             logging.debug('Waiting for all mappers to finish before calling reduce..')
             main_thread = threading.currentThread()
@@ -138,7 +140,7 @@ class Master:
                 res = create_workers(new_workers, self.project, self.zone, self.network)
             logging.debug("Starting reducers..")
             for worker, ip in zip(reducer["workers"], self.chunk_keys):
-                t = threading.Thread(target = start_worker, args = (error, master, mapper, worker, self.data_store, output_data["task_address"], intermediate_data["task_name"]))
+                t = threading.Thread(target = start_worker, args = (error, self.oslogin, self.gcloud["service_account"], master, reducer["task_name"], worker, self.data_store, output_data["task_address"], intermediate_data["task_name"]))
                 t.start()
             logging.debug('Waiting for all reducers to finish..')
             main_thread = threading.currentThread()
@@ -168,17 +170,12 @@ class Master:
         logging.debug("Existing master...")
         if self.cs:
             self.cs.close()
-#            main = self.config["main"]
-            master = self.config["master"]
-#            if main["task_address"] != master["task_address"]:
-#                send_log_file(main, master)
-        # Deleting gcloud compute instances for worker nodes
-        numWorkers = len(self.config['workers'])
-        workers = self.config['workers']
-        master = self.config["master"]
-        for i in range(numWorkers):
-            if master["task_address"] != workers[i]["task_address"]:
-                pass
+#        master = self.config["master"]
+#        result = service.instances().list(project=project, zone=zone).execute()
+#        master = self.config["master"]["task_address"]
+#        data_store = self.config["store"]["task_address"]
+#        
+#        names = [item["name"] for item in result["items"] if item['status'] == "RUNNING"]
         t = threading.Thread(target = shutdown_thread)
         t.start()
         return "Destroyed master"
@@ -303,7 +300,7 @@ def create_ssh_key(oslogin, account, private_key_file=None, expire_time=300):
     return private_key_file
 
 
-def start_worker(error, oslogin, account, master, task, worker, data_store, op_key, ip_key):
+def start_worker(error, oslogin, account, master, task_name, worker, data_store, op_key, ip_key):
     """
     Helper function that executes map/reduce script on remote/local machine.
     Takes the following arguments:
@@ -321,8 +318,8 @@ def start_worker(error, oslogin, account, master, task, worker, data_store, op_k
         private_key_file = create_ssh_key(oslogin, account)
         profile = oslogin.users().getLoginProfile(name=account).execute()
         username = profile.get('posixAccounts')[0].get('username')
-        dest = worker["task_address"]+":"+"/home/"+username+task["task_name"]
-        cmd = ["gcloud", "compute", "scp", task["task_name"], dest]
+        dest = worker["task_address"]+":"+"/home/"+username+'/'+task_name
+        cmd = ["gcloud", "compute", "scp", task_name, dest]
         logging.info("Send the map/reduce script to worker node..")
         scp = subprocess.Popen(cmd, shell = False, stderr = subprocess.PIPE)
         scp.wait()
@@ -332,9 +329,9 @@ def start_worker(error, oslogin, account, master, task, worker, data_store, op_k
                 errs = errs.decode()
             msg = "worker-" + str(worker["task_address"]) + " : " + errs
             error.set_error(msg)
-        cmd = ["ssh", "-i", private_key_file, '-o', 'StrictHostKeyChecking=no', '{username}@{hostname}'.format(username=username, hostname=worker["task_address"]), "python3", task["task_name"], data_store[0], str(data_store[1]), ip_key, op_key]
+        cmd = ["ssh", "-i", private_key_file, '-o', 'StrictHostKeyChecking=no', '{username}@{hostname}'.format(username=username, hostname=worker["task_address"]), "python3", task_name, data_store[0], str(data_store[1]), ip_key, op_key]
     else:
-        cmd = ["python3", task["task_name"], data_store[0], str(data_store[1]), ip_key, op_key]
+        cmd = ["python3", task_name, data_store[0], str(data_store[1]), ip_key, op_key]
     proc = subprocess.Popen(cmd, shell = False, stderr = subprocess.PIPE)
     proc.wait()
     errs = proc.stderr.readlines()
@@ -358,10 +355,10 @@ if __name__ == "__main__":
         m = Master(data_store, config_file_name)
         
         master = m.config["master"]
-        with SimpleXMLRPCServer((master["task_address"], int(master["task_port"]))) as server:
-            server.register_introspection_functions()
-            server.register_instance(m)
-            server.serve_forever()
+        server = SimpleXMLRPCServer(("localhost", int(master["task_port"])))
+        server.register_introspection_functions()
+        server.register_instance(m)
+        server.serve_forever()
         sys.stdout.buffer.write(b"Successfully exiting master..")
         sys.stdout.flush()
     except Exception as e:

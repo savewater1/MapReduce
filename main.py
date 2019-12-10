@@ -114,10 +114,15 @@ if __name__ == "__main__":
         with open(config_file, "rb") as file:
             config = json.load(file)
         
+        # Driver program configurations
+        main = config["main"]
         # Data Store
         store = config["store"]
         # Data Store Address
-        data_store = (store["task_address"], store["task_port"])
+        if store["task_address"] == main["task_address"]:
+            data_store = (store["task_address"], store["task_port"])
+        else:
+            data_store = (store["external_ip"], store["task_port"])
         
         # Estabilishing connection to data store
         logger.debug("Estabilihing connection to data store..")
@@ -147,35 +152,15 @@ if __name__ == "__main__":
         # Send master script to node executing master if the
         # node is different than the one executing main program
         if main["task_address"]!=master["task_address"]:
-#            logger.debug("The master is to be executed on "+master["task_address"]+"..")
-#            DEST = master["task_address"]+":"+master["task_exec_path"]
-#            logger.debug("Send the master script to node executing master..")
-#            COMMAND = ["scp", "%s" % master["task_name"], "%s" % DEST]
-#            scp = subprocess.Popen(COMMAND, shell = False)
-#            scp.wait()
-#            logger.debug("Modify permission of master script on node executing master..")
-#            COMMAND = ["ssh", "%s" % master["task_address"], "chmod +x", "/".join(master["task_exec_path"], master["task_name"])]
-#            ssh = subprocess.Popen(COMMAND, shell = False)
-#            ssh.wait()
-#            logger.debug("Send the mapper script to node executing master..")
-#            COMMAND = ["scp", "%s" % mapper["task_name"], "%s" % DEST]
-#            scp = subprocess.Popen(COMMAND, shell = False)
-#            scp.wait()
-#            logger.debug("Send the reducer script to node executing master..")
-#            COMMAND = ["scp", "%s" % reducer["task_name"], "%s" % DEST]
-#            scp = subprocess.Popen(COMMAND, shell = False)
-#            scp.wait()
-#            logger.debug("Launching Master!")
-#            cmd = ["ssh", "%s" % master["task_address"], "python3", "-u", "-", "--opt", "config", data_store[0], data_store[1], "<", config["master"]["task_name"]]
-            pass
+            cmd = ["gcloud", "compute", "ssh", master['task_address'], "--command", "python3 "+master['task_name']+" config "+store["task_address"]+" "+str(store["task_port"]), "--", "-L"+str(master["task_port"])+":localhost:"+str(master["task_port"])]
         else:
-            cmd = ["python3", master["task_name"], "config", data_store[0], str(data_store[1])]
+            cmd = ["python3", master["task_name"], "config", store["task_address"], str(store["task_port"])]
         
 #        pdb.set_trace()
         proc = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # Waiting for master to get started
-        time.sleep(5)
-        with xmlrpc.client.ServerProxy("http://"+master["task_address"]+":"+master["task_port"]+"/") as proxy:
+        time.sleep(10)
+        with xmlrpc.client.ServerProxy("http://localhost"+":"+master["task_port"]+"/") as proxy:
             op = proxy.init_cluster()
             logger.debug(op)
             op = proxy.runmapred()
