@@ -184,7 +184,7 @@ if __name__ == "__main__":
             logger.debug(op)
         
         proc.wait()
-        result, error = proc.communicate(timeout=5)
+        result, error = proc.communicate()
         if result == [] or proc.returncode != 0:
             logger.error("Master Did Not FINISH!!")
             logger.error(str(error))
@@ -201,10 +201,10 @@ if __name__ == "__main__":
         if proc.returncode == None:
             logger.debug("Killing master..")
             try:
-                outs, errs = proc.communicate(timeout=5)
+                outs, errs = proc.communicate(timeout=1)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                outs, errs = proc.communicate(timeout=5)
+                outs, errs = proc.communicate()
             logger.error("Master Did Not FINISH!!")
             logger.error(str(errs))
             logger.debug(str(outs))

@@ -54,7 +54,7 @@ class Master:
             input_data = get_key(self.cs, input_key)
             
             logging.info("partitioning data into chunks..")
-            numWorkers = len(self.config['workers'])
+            numWorkers = len(self.config['mapper']['workers'])
             ind = [int(i*len(input_data)/numWorkers) for i in range(numWorkers)] + [len(input_data)]
             if type(input_data) in (str, list, tuple):
                 chunks = [input_data[ind[i]:ind[i+1]] for i in range(numWorkers)]
@@ -77,16 +77,20 @@ class Master:
             
             # Provisioning gcloud compute instances for worker nodes
             self.oslogin = googleapiclient.discovery.build("oslogin", "v1")
-            self.account = self.config["service_account"]["address"]
+            # ADD service account details in config
+            self.account = self.config["gcloud"]["service_account"]
             if not self.account.startswith('users/'):
                 self.account = 'users/' + self.account
             self.compute = googleapiclient.discovery.build('compute', 'v1')
-            numWorkers = len(self.config['workers'])
-            workers = self.config['workers']
+            # Add project, zone and network info in config
+            self.gcloud = self.config["gcloud"]
+            
+            workers = self.config['mapper']['workers']
             master = self.config["master"]
-            for i in range(numWorkers):
-                if master["task_address"] != workers[i]["task_address"]:
-                    pass
+            names = [worker["task_address"] for worker in workers if master["task_address"] != worker["task_address"]]
+            if names:
+                res = create_workers(names, self.gcloud["project_id"], self.gcloud["zone"], self.gcloud["network"])
+                logging.debug(res)
             return "Server Initialized Successfully"
         except Exception as e:
             logging.exception(e)
@@ -94,27 +98,18 @@ class Master:
             self.destroy()
             
     
-    def runmapred(self):
-        """
-        Include this when sshing into remote vm to submit map-reduce tasks:
-            private_key_file = create_ssh_key(oslogin, account)
-            profile = oslogin.users().getLoginProfile(name=account).execute()
-            username = profile.get('posixAccounts')[0].get('username')
-        """
-        
+    def runmapred(self): 
         try:
+            error = Error()
             # Master configuration
             master = self.config["master"]
             # Mapper configuration
             mapper = self.config["mapper"] 
             # Intermediate Data configuration
             intermediate_data = self.config["intermediate_data"]
-            # Worker configuration
-            workers = self.config['workers']
-            error = Error()
-            logging.debug("Starting workers..")
-            for worker, ip in zip(workers, self.chunk_keys):
-                t = threading.Thread(target = start_worker, args = (error, master, mapper, worker, self.data_store, intermediate_data["task_address"], ip))
+            logging.debug("Starting mappers..")
+            for worker, ip in zip(mapper["workers"], self.chunk_keys):
+                t = threading.Thread(target = start_worker, args = (error, self.oslogin, self.gcloud["service_account"], master, mapper, worker, self.data_store, intermediate_data["task_address"], ip))
                 t.start()
             logging.debug('Waiting for all mappers to finish before calling reduce..')
             main_thread = threading.currentThread()
@@ -126,15 +121,42 @@ class Master:
                 raise(Exception("Worker Failure.."))
             logging.info("Workers finished execution of map tasks..")
             
+            # Reducer configuration
             reducer = self.config["reducer"]
+            # Output data configuration
             output_data = self.config["output_data"]
-            logging.debug("Starting reducer..")
-            t = threading.Thread(target = start_worker, args = (error, master, reducer, workers[0], self.data_store, output_data["task_address"], intermediate_data["task_name"]))
-            t.start()
-            t.join()
+            rwa = set([rw["task_address"] for rw in reducer["workers"]])
+            mwa = set([mw["task_address"] for mw in mapper["workers"]])
+            new_workers = [a for a in rwa if (a not in mwa)&(a!="localhost")]
+            del_workers = [a for a in mwa if (a not in rwa)&(a!="localhost")]
+            if del_workers:
+                logging.debug("Deleting map workers which won't be reused..")
+                res = delete_workers(del_workers, self.project)
+                logging.debug(res)
+            if new_workers:
+                logging.debug("Creating new workers for reduce tasks..")
+                res = create_workers(new_workers, self.project, self.zone, self.network)
+            logging.debug("Starting reducers..")
+            for worker, ip in zip(reducer["workers"], self.chunk_keys):
+                t = threading.Thread(target = start_worker, args = (error, master, mapper, worker, self.data_store, output_data["task_address"], intermediate_data["task_name"]))
+                t.start()
+            logging.debug('Waiting for all reducers to finish..')
+            main_thread = threading.currentThread()
+            for t in threading.enumerate():
+                if t is not main_thread:
+                    t.join()
             if error.get_flag() == 1:
                 logging.error("\n".join(error.get_error()))
                 raise(Exception("Worker Failure.."))
+            logging.info("Workers finished execution of reduce tasks..")
+# =============================================================================
+#             t = threading.Thread(target = start_worker, args = (error, master, reducer, reducer["workers"], self.data_store, output_data["task_address"], intermediate_data["task_name"]))
+#             t.start()
+#             t.join()
+#             if error.get_flag() == 1:
+#                 logging.error("\n".join(error.get_error()))
+#                 raise(Exception("Worker Failure.."))
+# =============================================================================
             return "Successfully finished map and reduce tasks.."
         except Exception as e:
             logging.exception(e)
@@ -220,6 +242,40 @@ def set_key(sock, key, value):
     if msg == False:
         raise(Exception("Couldn't set value.."))
 
+
+def create_workers(names, project, zone, network):
+    """
+    Create gcloud compute instance. These instances are used as worker nodes to execute
+    map and reduce tasks. It accepts the following arguments:
+        names: a list of names, one each for a worker node
+        project: name of the project that compute instances are attached to
+        zone: zone for instances
+        network: virtual network used by the map-reduce system
+    """
+    cmd = ["gcloud", "compute", "instances", "create", " ".join(names), "--project "+project, "--zone "+zone, "--no-service-account", "--no-scopes", "--network "+network, "--metadata=enable-oslogin=TRUE", "--quiet"]
+    proc = subprocess.Popen(cmd, shell = False, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+    proc.wait()
+    out, err = proc.communicate()
+    logging.debug(out.decode())
+    if err or proc.returncode!=0:
+        raise Exception("Instance creation failure!!")
+    return "Instances created successfully!!"
+
+
+def delete_workers(names, project):
+    """
+    Delete gcloud compute instances.
+    """
+    cmd = ["gcloud", "compute", "instances", "delete", " ".join(names), "--project "+project, "--quiet"]
+    proc = subprocess.Popen(cmd, shell = False, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+    proc.wait()
+    out, err = proc.communicate()
+    logging.debug(out.decode())
+    if err or proc.returncode!=0:
+        raise Exception("Instance deletion failure!!")
+    return "Instances terminated and deleted successfully!!"
+
+
 def create_ssh_key(oslogin, account, private_key_file=None, expire_time=300):
     """Generate an SSH key pair and apply it to the specified account."""
     private_key_file = private_key_file or '/tmp/key-' + str(uuid.uuid4())
@@ -246,30 +302,46 @@ def create_ssh_key(oslogin, account, private_key_file=None, expire_time=300):
     oslogin.users().importSshPublicKey(parent=account, body=body).execute()
     return private_key_file
 
-def start_worker(error, master, mapper, worker, data_store, op_key, ip_key):
+
+def start_worker(error, oslogin, account, master, task, worker, data_store, op_key, ip_key):
+    """
+    Helper function that executes map/reduce script on remote/local machine.
+    Takes the following arguments:
+        error: Common data structure shared between workers for error reporting
+        master: Master's configurations
+        task: Task configurations
+        worker: worker's configurations
+        data_store: key-val store's configurations
+        op_key: Key to be used to store the output
+        ip_key: Key to used to fetch the input
+        oslogin: used to login into gcloud compute instance, if the worker is running on remote VM
+        account: service account
+    """
     if master["task_address"] != worker["task_address"]:
-#        DEST = worker["task_address"]+":"+worker["task_exec_path"]
-#        logging.info("Send the master script to node executing master..")
-#        COMMAND = ["scp", "%s" % mapper["task_name"], "%s" % DEST]
-#        scp = subprocess.Popen(COMMAND, shell = False)
-#        scp.wait()
-#        # Command for changing permission of mapper file on worker node
-#        cmd = ["ssh", "%s" % worker, "python3", "-u", "-", "--opt ", ip, "<", "mapper.py" ]
-        pass
+        private_key_file = create_ssh_key(oslogin, account)
+        profile = oslogin.users().getLoginProfile(name=account).execute()
+        username = profile.get('posixAccounts')[0].get('username')
+        dest = worker["task_address"]+":"+"/home/"+username+task["task_name"]
+        cmd = ["gcloud", "compute", "scp", task["task_name"], dest]
+        logging.info("Send the map/reduce script to worker node..")
+        scp = subprocess.Popen(cmd, shell = False, stderr = subprocess.PIPE)
+        scp.wait()
+        if scp.returncode != 0:
+            _, errs = scp.communicate()
+            if type(errs) == "bytes":
+                errs = errs.decode()
+            msg = "worker-" + str(worker["task_address"]) + " : " + errs
+            error.set_error(msg)
+        cmd = ["ssh", "-i", private_key_file, '-o', 'StrictHostKeyChecking=no', '{username}@{hostname}'.format(username=username, hostname=worker["task_address"]), "python3", task["task_name"], data_store[0], str(data_store[1]), ip_key, op_key]
     else:
-        cmd = ["python3", mapper["task_name"], data_store[0], str(data_store[1]), ip_key, op_key]
+        cmd = ["python3", task["task_name"], data_store[0], str(data_store[1]), ip_key, op_key]
     proc = subprocess.Popen(cmd, shell = False, stderr = subprocess.PIPE)
     proc.wait()
     errs = proc.stderr.readlines()
     if len(errs) != 0:
-        msg = "worker-" + str(worker["task_id"]) + " : " + str(errs)
+        msg = "worker-" + str(worker["task_address"]) + " : " + str(errs)
         error.set_error(msg)
 
-#def send_log_file(main, master):
-#    DEST = main["task_address"]+":"+main["task_exec_path"]
-#    cmd = ["scp", "master.log", "%s" %DEST]
-#    scp = subprocess.Popen(cmd, shell = False)
-#    scp.wait()
 
 def shutdown_thread():
     server.shutdown()

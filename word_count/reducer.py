@@ -85,7 +85,7 @@ def connect_store(data_store):
 if __name__ == "__main__":
     try:
         data_store = (sys.argv[1], int(sys.argv[2]))
-        input_key = sys.srgv[3]
+        input_key = sys.argv[3]
         output_key = sys.argv[4]
         cs = connect_store(data_store)
         if not cs:
@@ -99,7 +99,7 @@ if __name__ == "__main__":
                 di[tup[0]] = tup[1]
         set_key(cs, output_key, di)
     except Exception as e:
-        sys.stderr.buffer.write(e)
+        sys.stderr.buffer.write(e.encode())
     finally:
         cs.close()
         del cs

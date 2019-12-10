@@ -95,7 +95,7 @@ if __name__ == "__main__":
         output_data = [(w, words.count(w)) for w in set(words)]
         append_key(cs, output_key, output_data)
     except Exception as e:
-        sys.stderr.buffer.write(e)
+        sys.stderr.buffer.write(e.encode())
     finally:
         cs.close()
         del cs
