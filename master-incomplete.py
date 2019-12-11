@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Dec 10 20:30:00 2019
+Created on Mon Oct 28 21:30:00 2019
 
 @author: amits
 """
@@ -11,9 +11,12 @@ import select
 import pickle
 import subprocess
 import logging
+import uuid
+import time
 import threading
 from xmlrpc.server import SimpleXMLRPCServer
 from googleapiclient import discovery
+from oauth2client.client import GoogleCredentials
 
 
 
@@ -73,13 +76,18 @@ class Master:
             intermediate_data = self.config["intermediate_data"]
             set_key(self.cs, intermediate_data["task_address"], [])
             
-            # gcloud configuration
+            self.oslogin = discovery.build("oslogin", "v1")
+            self.account = self.config["gcloud"]["service_account"]
+            if not self.account.startswith('users/'):
+                self.account = 'users/' + self.account
+# =============================================================================
+#             self.private_key_file = create_ssh_key(self.oslogin, self.account)
+#             profile = self.oslogin.users().getLoginProfile(name=self.account).execute()
+#             self.username = profile.get('posixAccounts')[0].get('username')
+# =============================================================================
+            credentials = GoogleCredentials.get_application_default()
+            self.compute = discovery.build('compute', 'v1', credentials=credentials, cache_discovery = False)
             self.gcloud = self.config["gcloud"]
-            
-            # username
-            oslogin = discovery.build("oslogin", "v1")
-            profile = oslogin.users().getLoginProfile(name="users/"+self.gcloud["service_account"]).execute()
-            self.username = profile.get('posixAccounts')[0].get('username')
             
             logging.debug("Provisioning gcloud compute instances for worker nodes of map task..")
             workers = self.config['mapper']['workers']
@@ -106,7 +114,7 @@ class Master:
             intermediate_data = self.config["intermediate_data"]
             logging.debug("Starting mappers..")
             for worker, ip in zip(mapper["workers"], self.chunk_keys):
-                t = threading.Thread(target = start_worker, args = (error, self.username, self.gcloud["zone"], master, mapper["task_name"], worker, self.data_store, intermediate_data["task_address"], ip))
+                t = threading.Thread(target = start_worker, args = (error, self.oslogin, self.account, self.gcloud["zone"], master, mapper["task_name"], worker, self.data_store, intermediate_data["task_address"], ip))
                 t.start()
             logging.debug('Waiting for all mappers to finish before calling reduce..')
             main_thread = threading.currentThread()
@@ -135,7 +143,7 @@ class Master:
                 res = create_workers(new_workers, self.gcloud["project"], self.gcloud["zone"], self.gcloud["network"])
             logging.debug("Starting reducers..")
             for worker, ip in zip(reducer["workers"], self.chunk_keys):
-                t = threading.Thread(target = start_worker, args = (error, self.username, self.gcloud["zone"], master, reducer["task_name"], worker, self.data_store, output_data["task_address"], intermediate_data["task_name"]))
+                t = threading.Thread(target = start_worker, args = (error, self.oslogin, self.account, self.gcloud["zone"], master, reducer["task_name"], worker, self.data_store, output_data["task_address"], intermediate_data["task_name"]))
                 t.start()
             logging.debug('Waiting for all reducers to finish..')
             main_thread = threading.currentThread()
@@ -274,8 +282,34 @@ def delete_workers(names, project, zone):
     return "Instances terminated and deleted successfully!!"
 
 
+def create_ssh_key(oslogin, account, private_key_file=None, expire_time=300):
+    """Generate an SSH key pair and apply it to the specified account."""
+    private_key_file = private_key_file or '/tmp/key-' + str(uuid.uuid4())
+    cmd = ['ssh-keygen', '-t', 'rsa', '-N', '', '-f', private_key_file]
+    keygen = subprocess.Popen(cmd, shell = False, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+    keygen.wait()
+    output = keygen.communicate()[0]
+    returncode = keygen.returncode
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, cmd)
+    if output:
+        logging.info(output)
 
-def start_worker(error, username, zone, master, task_name, worker, data_store, op_key, ip_key):
+    with open(private_key_file + '.pub', 'r') as original:
+        public_key = original.read().strip()
+
+    # Expiration time is in microseconds.
+    expiration = int((time.time() + expire_time) * 1000000)
+
+    body = {
+        'key': public_key,
+        'expirationTimeUsec': expiration,
+    }
+    oslogin.users().importSshPublicKey(parent=account, body=body).execute()
+    return private_key_file
+
+
+def start_worker(error, oslogin, account, zone, master, task_name, worker, data_store, op_key, ip_key):
     """
     Helper function that executes map/reduce script on remote/local machine.
     Takes the following arguments:
@@ -291,8 +325,11 @@ def start_worker(error, username, zone, master, task_name, worker, data_store, o
     """
     try:
         if master["task_address"] != worker["task_address"]:
-            dest = worker["task_address"]+":"+"/home/"+username+"/"+task_name
-            cmd = ["gcloud", "compute", "scp", task_name,   dest, "--zone", zone, "--quiet"]
+            private_key_file = create_ssh_key(oslogin, account)
+            profile = oslogin.users().getLoginProfile(name=account).execute()
+            username = profile.get('posixAccounts')[0].get('username')
+            dest = worker["task_address"]+":"+"/home/"+username+'/'+task_name
+            cmd = ["gcloud", "compute", "scp", task_name, dest, "--zone", zone, "--quiet"]
             logging.info("Send the map/reduce script to worker node..")
             scp = subprocess.Popen(cmd, shell = False, stderr = subprocess.PIPE)
             scp.wait()
@@ -301,14 +338,14 @@ def start_worker(error, username, zone, master, task_name, worker, data_store, o
                 errs = errs.decode()
                 msg = "worker-" + str(worker["task_address"]) + " : " + errs
                 error.set_error(msg)
-            cmd = ["gcloud", "compute", "ssh", worker["task_address"], "--command", " ".join(["python3", "/home/"+username+"/"+task_name, data_store[0], str(data_store[1]), ip_key, op_key]), "--zone", zone]
+            cmd = ["ssh", "-i", private_key_file, '-o', 'StrictHostKeyChecking=no', '{username}@{hostname}'.format(username=username, hostname=worker["task_address"]), "python3", task_name, data_store[0], str(data_store[1]), ip_key, op_key]
         else:
             cmd = ["python3", task_name, data_store[0], str(data_store[1]), ip_key, op_key]
         proc = subprocess.Popen(cmd, shell = False, stderr = subprocess.PIPE)
         proc.wait()
         _, errs = proc.communicate()
         errs = errs.decode()
-        if errs:
+        if len(errs) != 0:
             raise Exception(errs)
     except Exception as e:
         msg = "worker-" + str(worker["task_address"]) + " : " + str(e)
